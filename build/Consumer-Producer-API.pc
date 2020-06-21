@@ -1,0 +1,10 @@
+prefix=/usr/local
+libdir=/usr/local/lib
+includedir=/usr/local/include/Consumer-Producer-API
+
+Name: libconsumerproducer
+Description: Consumer/Producer API library
+Version: 0.1
+Libs: -L${libdir} -lconsumerproducer
+Cflags: -I${includedir}
+
