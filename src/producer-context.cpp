@@ -257,7 +257,7 @@ Producer::getFinalBlockIdFromBufferSize(Name contentName, Name functionName, siz
 }
 
 std::map<uint64_t, shared_ptr<Data>>
-Producer::getDataSegmentMap(Name suffix, const uint8_t* buf, size_t bufferSize)
+Producer::getDataSegmentMap(Name suffix, const uint8_t* buf, size_t bufferSize, Function executedFunction)
 {
   std::map<uint64_t, shared_ptr<Data>> dataBuffer;
 
@@ -271,7 +271,13 @@ Producer::getDataSegmentMap(Name suffix, const uint8_t* buf, size_t bufferSize)
   Block nameOnWire = name.wireEncode();
   size_t bytesOccupiedByName = nameOnWire.size();
 
-  Function funcname(m_functionAsName.toUri());
+  Function funcname;
+  if(executedFunction.toUri() == "/"){
+    funcname = Function(m_functionAsName.toUri());
+  }
+  else{
+    funcname = Function(m_functionAsName.toUri()).append(executedFunction.toUri());
+  }
 
   Block funcnameOnWire = funcname.wireEncode();
   size_t bytesOccupiedByFuncName = funcnameOnWire.size();
@@ -302,7 +308,7 @@ Producer::getDataSegmentMap(Name suffix, const uint8_t* buf, size_t bufferSize)
 
     shared_ptr<Data> data = make_shared<Data>(fullName);
 
-    data->setFunction(Function(m_functionAsName.toUri()));
+    data->setFunction(funcname);
 
     data->setFreshnessPeriod(time::milliseconds(m_dataFreshness));
 
@@ -326,6 +332,207 @@ Producer::getDataSegmentMap(Name suffix, const uint8_t* buf, size_t bufferSize)
 
   finalSegment = i;
   return dataBuffer;
+}
+
+void
+Producer::produce(Name suffix, Function executedFunction, const uint8_t* buf, size_t bufferSize)
+{
+  if (bufferSize == 0)
+    return;
+
+  int bytesPackaged = 0;
+
+  Name name(m_prefix);
+  if (!suffix.empty()) {
+    name.append(suffix);
+  }
+
+  Block nameOnWire = name.wireEncode();
+  size_t bytesOccupiedByName = nameOnWire.size();
+
+  Function funcname;
+  if(executedFunction.toUri() == "/"){
+    funcname = Function(m_functionAsName.toUri());
+  }
+  else{
+    funcname = Function(m_functionAsName.toUri()).append(executedFunction.toUri());
+  }
+
+  Block funcnameOnWire = funcname.wireEncode();
+  size_t bytesOccupiedByFuncName = funcnameOnWire.size();
+
+  int signatureSize = 32; //SHA_256 as default
+
+  int freeSpaceForContent = m_dataPacketSize - bytesOccupiedByName - bytesOccupiedByFuncName - signatureSize - m_keyLocatorSize - DEFAULT_SAFETY_OFFSET;
+
+  int numberOfSegments = bufferSize / freeSpaceForContent;
+
+  if (numberOfSegments == 0)
+    numberOfSegments++;
+
+  if (freeSpaceForContent * numberOfSegments < bufferSize)
+    numberOfSegments++;
+
+  uint64_t currentSegment = 0;
+  uint64_t initialSegment = currentSegment;
+  uint64_t finalSegment = currentSegment;
+
+  if (m_isMakingManifest) // segmentation with inlined manifests
+  {
+    shared_ptr<Data> dataSegment;
+    shared_ptr<Manifest> manifestSegment;
+    bool needManifestSegment = true;
+
+    for (int packagedSegments = 0; packagedSegments < numberOfSegments;) {
+      if (needManifestSegment) {
+        Name manifestName(m_prefix);
+        if (!suffix.empty())
+          manifestName.append(suffix);
+        manifestName.appendSegment(currentSegment);
+
+        if (manifestSegment) // send previous manifest
+        {
+          manifestSegment->encode();
+          passSegmentThroughCallbacks(manifestSegment);
+        }
+
+        manifestSegment = make_shared<Manifest>(manifestName); // new empty manifest
+        manifestSegment->setFinalBlockId(name::Component::fromSegment(currentSegment + numberOfSegments - packagedSegments));
+
+        finalSegment = currentSegment;
+        needManifestSegment = false;
+        currentSegment++;
+
+        m_keyLocator.clear();
+        m_keyLocator.setName(manifestSegment->getName());
+      }
+
+      Name fullName(m_prefix);
+      if (!suffix.empty())
+        fullName.append(suffix);
+      fullName.appendSegment(currentSegment);
+
+      dataSegment = make_shared<Data>(fullName);
+      dataSegment->setFunction(funcname);
+      dataSegment->setFreshnessPeriod(time::milliseconds(m_dataFreshness));
+      finalSegment = currentSegment;
+
+      if (packagedSegments == numberOfSegments - 1) // last segment
+      {
+        dataSegment->setContent(&buf[bytesPackaged], bufferSize - bytesPackaged);
+        bytesPackaged += bufferSize - bytesPackaged;
+      }
+      else {
+        dataSegment->setContent(&buf[bytesPackaged], freeSpaceForContent);
+        bytesPackaged += freeSpaceForContent;
+      }
+
+      dataSegment->setFinalBlockId(name::Component::fromSegment(currentSegment + numberOfSegments - packagedSegments - 1));
+
+      passSegmentThroughCallbacks(dataSegment);
+      currentSegment++;
+
+      size_t manifestSize = estimateManifestSize(manifestSegment);
+      size_t fullNameSize = dataSegment->getName().wireEncode().size() + dataSegment->getSignature().getValue().size();
+
+      if (manifestSize + 2 * fullNameSize > m_dataPacketSize) {
+        needManifestSegment = true;
+      }
+
+      const Block& block = dataSegment->wireEncode();
+      ndn::ConstBufferPtr implicitDigest = ndn::util::Sha256::computeDigest(block.wire(), block.size());
+
+      //add implicit digest to the manifest
+      manifestSegment->addNameToCatalogue(dataSegment->getName().getSubName(dataSegment->getName().size() - 1, 1), implicitDigest);
+
+      packagedSegments++;
+
+      if (packagedSegments == numberOfSegments) // last manifest to include last segment
+      {
+        manifestSegment->encode();
+        passSegmentThroughCallbacks(manifestSegment);
+      }
+    }
+  }
+  else // just normal segmentation
+  {
+    uint64_t i = 0;
+    for (i = currentSegment; i < numberOfSegments + currentSegment; i++) {
+      Name fullName(m_prefix);
+      if (!suffix.empty())
+        fullName.append(suffix);
+
+      fullName.appendSegment(i);
+
+      shared_ptr<Data> data = make_shared<Data>(fullName);
+      data->setFunction(funcname);
+      data->setFreshnessPeriod(time::milliseconds(m_dataFreshness));
+
+      data->setFinalBlockId(name::Component::fromSegment(numberOfSegments + currentSegment - 1));
+
+      if (i == numberOfSegments + currentSegment - 1) // last segment
+      {
+        data->setContent(&buf[bytesPackaged], bufferSize - bytesPackaged);
+        bytesPackaged += bufferSize - bytesPackaged;
+      }
+      else {
+        data->setContent(&buf[bytesPackaged], freeSpaceForContent);
+        bytesPackaged += freeSpaceForContent;
+      }
+
+      passSegmentThroughCallbacks(data);
+    }
+
+    finalSegment = i;
+  }
+
+  // if user requested writing into the REPO
+  if (!m_targetRepoPrefix.empty()) {
+    Name dataPrefix(m_prefix);
+    dataPrefix.append(suffix);
+    writeToRepo(dataPrefix, initialSegment, finalSegment - 1);
+  }
+
+  // if data is INFOMAX list or meta info, do not update INFOMAX tree
+  for (unsigned int i = 0; i < suffix.size(); i++) {
+    if (suffix.get(i).toUri().compare(INFOMAX_INTEREST_TAG) == 0) {
+      return;
+    }
+  }
+
+  // if infomax mode is enabled
+  if (m_infomaxType == INFOMAX_MERGE_PRIORITY || m_infomaxType == INFOMAX_SIMPLE_PRIORITY) {
+    m_isNewInfomaxData = true;
+    size_t lastElement = suffix.size();
+    TreeNode* prev = &m_infomaxRoot;
+
+    for (size_t i = 1; i <= suffix.size(); ++i) {
+      std::vector<TreeNode*> prevChildren = prev->getChildren();
+      TreeNode* curr = 0;
+
+      for (size_t j = 0; j < prevChildren.size(); j++) {
+        if (prevChildren[j]->getName().equals(suffix.getSubName(0, i))) {
+          curr = prevChildren[j];
+          break;
+        }
+      }
+
+      if (curr == 0) {
+        if (i == lastElement) {
+          curr = new TreeNode(suffix, prev);
+          curr->setDataNode(true);
+          prev->addChild(curr);
+        }
+        else {
+          Name* insertName = new Name(suffix.getSubName(0, i).toUri());
+          curr = new TreeNode(*insertName, prev);
+          prev->addChild(curr);
+        }
+      }
+
+      prev = curr;
+    }
+  }
 }
 
 void
